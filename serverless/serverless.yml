@@ -1,0 +1,50 @@
+service: aws-fanout-pattern
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: python3.11
+  region: us-east-1
+  iam:
+    role:
+      statements:
+      - Effect: Allow
+        Action:
+        - sns:Publish
+        Resource: ${file(../terraform/outputs.json):sns_topic_arn}
+
+functions:
+  publisher:
+    handler: handlers.publisher.handler
+    environment:
+      SNS_TOPIC_ARN: ${file(../terraform/outputs.json):sns_topic_arn}
+    events:
+    - httpApi:
+        path: /publish
+        method: post
+  consumer_1:
+    handler: handlers.consumer.handler
+    events:
+    - sqs:
+        arn: ${file(../terraform/outputs.json):queues[0].url}
+  consumer_2:
+    handler: handlers.consumer.handler
+    events:
+    - sqs:
+        arn: ${file(../terraform/outputs.json):queues[1].url}
+  consumer_3:
+    handler: handlers.consumer.handler
+    events:
+    - sqs:
+        arn: ${file(../terraform/outputs.json):queues[2].url}
+
+plugins:
+- serverless-python-requirements
+
+package:
+  individually: true
+
+custom:
+  pythonRequirements:
+    dockerizePip: non-linux
