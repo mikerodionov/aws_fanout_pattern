@@ -4,8 +4,8 @@ frameworkVersion: '3'
 
 provider:
   name: aws
-  runtime: python3.11
-  region: us-east-1
+  runtime: python3.13
+  region: ${opt:region, 'us-east-1'}
   iam:
     role:
       statements:
@@ -13,6 +13,10 @@ provider:
         Action:
         - sns:Publish
         Resource: ${file(../terraform/outputs.json):sns_topic_arn}
+      - Effect: Allow
+        Action:
+        - dynamodb:PutItem
+        Resource: ${file(../terraform/outputs.json):dynamodb_table_arn}
 
 functions:
   publisher:
@@ -23,21 +27,33 @@ functions:
     - httpApi:
         path: /publish
         method: post
+
   consumer_1:
     handler: handlers.consumer.handler
+    environment:
+      DDB_TABLE_NAME: ${file(../terraform/outputs.json):dynamodb_table_name}
+      CONSUMER_ID: consumer_1
     events:
     - sqs:
-        arn: ${file(../terraform/outputs.json):queues[0].url}
+        arn: ${file(../terraform/outputs.json):queue_1_arn}
+
   consumer_2:
     handler: handlers.consumer.handler
+    environment:
+      DDB_TABLE_NAME: ${file(../terraform/outputs.json):dynamodb_table_name}
+      CONSUMER_ID: consumer_2
     events:
     - sqs:
-        arn: ${file(../terraform/outputs.json):queues[1].url}
+        arn: ${file(../terraform/outputs.json):queue_2_arn}
+
   consumer_3:
     handler: handlers.consumer.handler
+    environment:
+      DDB_TABLE_NAME: ${file(../terraform/outputs.json):dynamodb_table_name}
+      CONSUMER_ID: consumer_3
     events:
     - sqs:
-        arn: ${file(../terraform/outputs.json):queues[2].url}
+        arn: ${file(../terraform/outputs.json):queue_3_arn}
 
 plugins:
 - serverless-python-requirements
@@ -47,4 +63,5 @@ package:
 
 custom:
   pythonRequirements:
-    dockerizePip: non-linux
+    dockerizePip: false
+    pythonBin: python3

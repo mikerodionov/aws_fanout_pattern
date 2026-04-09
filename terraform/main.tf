@@ -6,12 +6,26 @@ resource "random_id" "suffix" {
   byte_length = 4
 }
 
+# Dead-letter queues — one per main queue
+resource "aws_sqs_queue" "dlqs" {
+  count = var.queue_count
+
+  name                      = "${var.queue_name_prefix}-${count.index + 1}-dlq-${random_id.suffix.hex}"
+  message_retention_seconds = 1209600 # 14 days to allow investigation
+}
+
 resource "aws_sqs_queue" "queues" {
   count = var.queue_count
 
   name                      = "${var.queue_name_prefix}-${count.index + 1}-${random_id.suffix.hex}"
+  delay_seconds              = 60      # messages sit in queue 60s before consumers can pick them up
   visibility_timeout_seconds = 30
-  message_retention_seconds  = 86400
+  message_retention_seconds  = 1209600 # 14 days
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlqs[count.index].arn
+    maxReceiveCount     = 3
+  })
 }
 
 resource "aws_sns_topic_subscription" "to_queue" {
@@ -53,14 +67,27 @@ resource "aws_sqs_queue_policy" "allow_sns" {
 # Produce outputs object for serverless to consume
 locals {
   queues = [for q in aws_sqs_queue.queues : {
-    name     = q.name
-    url      = q.id
-    arn      = q.arn
+    name = q.name
+    url  = q.id
+    arn  = q.arn
+  }]
+
+  dlqs = [for q in aws_sqs_queue.dlqs : {
+    name = q.name
+    url  = q.id
+    arn  = q.arn
   }]
 
   base_outputs = {
-    sns_topic_arn = aws_sns_topic.fanout.arn
-    queues        = local.queues
+    sns_topic_arn        = aws_sns_topic.fanout.arn
+    queues               = local.queues
+    dlqs                 = local.dlqs
+    dynamodb_table_name  = aws_dynamodb_table.messages.name
+    dynamodb_table_arn   = aws_dynamodb_table.messages.arn
+    # Flat named keys for Serverless Framework (no array index support)
+    queue_1_arn          = aws_sqs_queue.queues[0].arn
+    queue_2_arn          = aws_sqs_queue.queues[1].arn
+    queue_3_arn          = aws_sqs_queue.queues[2].arn
   }
 }
 
@@ -220,47 +247,24 @@ resource "aws_lambda_function" "sqs_logger" {
   function_name    = "sqs-logger-${random_id.suffix.hex}"
   role             = aws_iam_role.lambda_exec.arn
   handler          = "sqs_logger.handler"
-  runtime          = "python3.11"
+  runtime          = "python3.13"
   source_code_hash = data.archive_file.sqs_logger_zip.output_base64sha256
 }
 
-# Event source mapping: connect logger to each SQS queue
-resource "aws_lambda_event_source_mapping" "sqs_to_logger" {
-  for_each = { for idx, q in aws_sqs_queue.queues : idx => q }
-
-  event_source_arn = each.value.arn
-  function_name    = aws_lambda_function.sqs_logger.arn
-  batch_size       = 10
-  enabled          = true
-}
-
-# Allow SNS to invoke the logger Lambda (for SNS->Lambda subscription)
-resource "aws_lambda_permission" "sns_invoke_logger" {
-  statement_id  = "AllowExecutionFromSNSForLogger"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.sqs_logger.function_name
-  principal     = "sns.amazonaws.com"
-  source_arn    = aws_sns_topic.fanout.arn
-}
-
-# Subscribe the logger Lambda to the SNS topic (so SNS messages also get logged)
-resource "aws_sns_topic_subscription" "logger_sub" {
-  topic_arn = aws_sns_topic.fanout.arn
-  protocol  = "lambda"
-  endpoint  = aws_lambda_function.sqs_logger.arn
-}
+# sqs_logger is invoked by the Serverless consumer Lambdas via the SQS event source
+# mappings defined in serverless.yml — no separate event source mapping here to avoid
+# competing consumers on the same queues (each SQS message can only be delivered once).
 
 resource "aws_lambda_function" "publisher" {
   filename         = data.archive_file.publisher_zip.output_path
   function_name    = "publisher-${random_id.suffix.hex}"
   role             = aws_iam_role.lambda_exec.arn
   handler          = "publisher.handler"
-  runtime          = "python3.11"
+  runtime          = "python3.13"
   source_code_hash = data.archive_file.publisher_zip.output_base64sha256
   environment {
     variables = {
       SNS_TOPIC_ARN = aws_sns_topic.fanout.arn
-      DDB_TABLE_NAME = aws_dynamodb_table.messages.name
     }
   }
 }
@@ -553,6 +557,56 @@ resource "aws_cloudwatch_metric_alarm" "sqs_age_oldest_per_queue" {
   threshold           = 300
   comparison_operator = "GreaterThanOrEqualToThreshold"
   alarm_description   = "Alarm when oldest message in queue ${each.key} is older than 5 minutes"
+}
+
+# ---------------------------
+# Dead-letter queue alarms
+# ---------------------------
+
+# Alarm when any message lands in a DLQ (means a consumer failed 3 times)
+resource "aws_cloudwatch_metric_alarm" "dlq_messages_visible" {
+  for_each = { for idx, q in aws_sqs_queue.dlqs : idx => q }
+
+  alarm_name          = "dlq-messages-visible-${random_id.suffix.hex}-${each.key}"
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  dimensions = {
+    QueueName = each.value.name
+  }
+  statistic           = "Sum"
+  period              = 60
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  alarm_description   = "DLQ ${each.value.name} has messages — consumer failed after 3 retries"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+}
+
+# Grant Lambda permission to receive/delete from DLQs (for manual redriving)
+resource "aws_iam_policy" "lambda_dlq_policy" {
+  name = "lambda-dlq-${random_id.suffix.hex}"
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+          "sqs:ChangeMessageVisibility",
+          "sqs:SendMessage"
+        ],
+        Resource = [for q in aws_sqs_queue.dlqs : q.arn]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_dlq_attach" {
+  role       = aws_iam_role.lambda_exec.name
+  policy_arn = aws_iam_policy.lambda_dlq_policy.arn
 }
 
 

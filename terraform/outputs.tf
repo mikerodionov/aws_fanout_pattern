@@ -9,3 +9,11 @@ output "queue_arns" {
 output "queue_urls" {
   value = [for q in aws_sqs_queue.queues : q.id]
 }
+
+output "dlq_arns" {
+  value = [for q in aws_sqs_queue.dlqs : q.arn]
+}
+
+output "dlq_urls" {
+  value = [for q in aws_sqs_queue.dlqs : q.id]
+}

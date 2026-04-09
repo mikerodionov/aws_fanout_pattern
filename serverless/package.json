@@ -1,0 +1,9 @@
+{
+  "name": "aws-fanout-pattern",
+  "version": "1.0.0",
+  "description": "AWS Fanout Pattern - Serverless deployment",
+  "devDependencies": {
+    "serverless": "^3.38.0",
+    "serverless-python-requirements": "^6.1.1"
+  }
+}

@@ -20,7 +20,8 @@ def publish(message: str):
         print('sns_topic_arn missing in outputs.json')
         sys.exit(1)
 
-    client = boto3.client('sns')
+    region = sns_arn.split(':')[3]
+    client = boto3.client('sns', region_name=region)
     resp = client.publish(TopicArn=sns_arn, Message=message)
     print('Published message, MessageId:', resp.get('MessageId'))
 
